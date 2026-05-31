@@ -137,7 +137,7 @@ async function checkCooldown(octokit, context, cooldownMinutes) {
   }
 }
 
-async function analyzeDiff(diff, modelId, openRouterKey, customPrompt, reasoningEffort) {
+async function analyzeDiff(diff, modelId, openRouterKey, customPrompt, reasoningEffort, maxTokens) {
   const defaultPrompt = `You are a highly skilled staff software engineer reviewing a pull request. 
 
 Avoid generic BS advice. For each advice, please provide a file Path of the related change. No need to paste the code itself.
@@ -187,6 +187,7 @@ Please be specific and provide actionable feedback. No generic BS advice.`;
           content: fullPrompt,
         },
       ],
+      max_tokens: maxTokens || 4096,
     };
 
     // Add reasoning_effort if specified (for reasoning models)
@@ -418,6 +419,7 @@ async function run() {
     const reviewLabel = core.getInput('review_label');
     const excludeFilesInput = core.getInput('exclude_files');
     const reasoningEffort = core.getInput('reasoning_effort');
+    const maxTokens = parseInt(core.getInput('max_tokens') || '4096', 10);
     const maxPrReviews = parseInt(core.getInput('max_pr_reviews') || '10', 10);
     const cooldownPeriod = parseInt(core.getInput('cooldown_period') || '0', 10);
 
@@ -509,7 +511,8 @@ async function run() {
       modelId,
       openRouterKey,
       customPrompt,
-      reasoningEffort
+      reasoningEffort,
+      maxTokens
     );
 
     // Get minimum_score input (default 75)
