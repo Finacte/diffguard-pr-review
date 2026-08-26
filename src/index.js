@@ -185,7 +185,7 @@ Please be specific and provide actionable feedback. No generic BS advice.`;
 Reply with a single JSON object and nothing else. No prose, no markdown fence.
 
 {
-  "summary": "One or two sentences on the change as a whole. Empty string if there is nothing to say.",
+  "summary": "At most two sentences framing the change as a whole. This is NOT where problems go — never describe a problem, a risk, or a rule violation here. If you catch yourself writing one, it belongs in findings instead. Empty string is fine.",
   "score": 0,
   "findings": [
     {
@@ -204,9 +204,16 @@ Rules for "path" and "line":
   the diff ADDS (a '+' line). Never point at a context line, a removed line, or
   a line the diff does not touch.
 - If a finding is not tied to one specific added line, omit "path" and "line".
-  It will still be reported, in the summary.
+  It is still reported. Never drop a finding just because it has no line —
+  this includes anything about the pull request itself rather than its code,
+  such as a missing label, a missing PR-body section, or the title format.
 - "score" is 0-100 for the overall change. Omit it if you were not asked to score.
-- Return "findings": [] when the change is fine. Do not invent findings.`
+- "findings": [] means you found nothing at all. It must be consistent with
+  "summary": an empty findings list next to a summary that describes a problem
+  is a contradiction. Do not invent findings either — a clean diff is normal.
+- Treat supplied project conventions as facts about the team's rules, not as
+  facts about the code. If a convention file contradicts the diff itself (a
+  stale version number, a renamed path), the code in the diff is the truth.`
     : '\n\nProvide your analysis in the specified format.';
 
   const fullPrompt = `${prompt}${contextBlock || ''}\n\nHere's the diff:\n${diff}${outputContract}`;
