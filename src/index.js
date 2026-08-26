@@ -472,18 +472,74 @@ function parseCommentableLines(diff) {
   return targets;
 }
 
-/** Pulls a JSON object out of a model reply that may be fenced or padded. */
+/**
+ * Pulls the first JSON value out of a model reply that may be fenced, padded
+ * with prose, or a bare array rather than an object.
+ */
 function extractJsonObject(text) {
   const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/);
   const candidate = (fenced ? fenced[1] : text).trim();
-  const start = candidate.indexOf('{');
-  const end = candidate.lastIndexOf('}');
-  if (start === -1 || end === -1 || end <= start) return null;
-  try {
-    return JSON.parse(candidate.slice(start, end + 1));
-  } catch {
-    return null;
+
+  // Whichever of { or [ appears first wins, so a bare findings array parses
+  // instead of the extractor grabbing the first object nested inside it.
+  const openers = [
+    ['{', '}'],
+    ['[', ']'],
+  ]
+    .map(([open, close]) => ({
+      start: candidate.indexOf(open),
+      end: candidate.lastIndexOf(close),
+    }))
+    .filter(({ start, end }) => start !== -1 && end > start)
+    .sort((a, b) => a.start - b.start);
+
+  for (const { start, end } of openers) {
+    try {
+      return JSON.parse(candidate.slice(start, end + 1));
+    } catch {
+      // try the next opener
+    }
   }
+  return null;
+}
+
+/**
+ * Finds the review object in whatever shape the model replied with.
+ *
+ * Providers wrap JSON-mode output inconsistently: Z.ai returns the review
+ * stringified inside {"answer": "..."}, others nest it under "response" or
+ * "result", and some return a bare findings array. Rather than special-case
+ * each wrapper key, walk the structure until an object with a findings array
+ * turns up, unwrapping JSON-in-a-string at every level.
+ *
+ * @returns {object|null} an object with a findings array, or null
+ */
+function coerceReviewObject(value, depth = 0) {
+  if (depth > 4 || value === null || value === undefined) return null;
+
+  if (typeof value === 'string') {
+    const inner = extractJsonObject(value);
+    return inner ? coerceReviewObject(inner, depth + 1) : null;
+  }
+
+  if (typeof value !== 'object') return null;
+
+  // A bare array of findings, with no envelope at all.
+  if (Array.isArray(value)) {
+    const allObjects =
+      value.length > 0 &&
+      value.every((entry) => entry && typeof entry === 'object');
+    return allObjects ? { summary: '', findings: value } : null;
+  }
+
+  if (Array.isArray(value.findings)) return value;
+
+  for (const nested of Object.values(value)) {
+    const found = coerceReviewObject(nested, depth + 1);
+    if (found) return found;
+  }
+
+  return null;
 }
 
 const SEVERITY_ICON = { high: '🔥', medium: '🟡', low: '🔵' };
@@ -891,7 +947,7 @@ async function run() {
     // falls back to being posted as a plain comment rather than discarded.
     let parsed = null;
     if (inlineComments) {
-      parsed = extractJsonObject(analysis);
+      parsed = coerceReviewObject(analysis);
       if (!parsed || !Array.isArray(parsed.findings)) {
         core.warning(
           'inline_comments is on but the model did not return parseable JSON. Falling back to a single summary comment.'
