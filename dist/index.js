@@ -41813,9 +41813,11 @@ Please be specific and provide actionable feedback. No generic BS advice.`;
       max_tokens: maxTokens || 4096,
     };
 
-    // Add reasoning_effort if specified (for reasoning models)
+    // Add reasoning effort if specified (for reasoning models).
+    // OpenRouter's canonical field is `reasoning: { effort }`; the flat
+    // `reasoning_effort` alias is not honoured by every upstream provider.
     if (reasoningEffort) {
-      requestBody.reasoning_effort = reasoningEffort;
+      requestBody.reasoning = { effort: reasoningEffort };
     }
 
     const response = await axios.post(
@@ -41830,11 +41832,61 @@ Please be specific and provide actionable feedback. No generic BS advice.`;
       }
     );
 
-    if (!response.data?.choices?.[0]?.message?.content) {
-      throw new Error('Invalid response format from OpenRouter API');
+    const data = response.data;
+
+    // OpenRouter can answer HTTP 200 with an error envelope instead of choices
+    // (no endpoint matching the account's data policy, upstream provider error,
+    // moderation). Surface it verbatim rather than as "invalid response format".
+    if (data?.error) {
+      throw new Error(
+        `OpenRouter returned an error: ${JSON.stringify(data.error)}`
+      );
     }
 
-    return response.data.choices[0].message.content;
+    const choice = data?.choices?.[0];
+    const finishReason = choice?.finish_reason || choice?.native_finish_reason;
+
+    if (data?.usage) {
+      core.info(
+        `Token usage: prompt=${data.usage.prompt_tokens} completion=${data.usage.completion_tokens} total=${data.usage.total_tokens}`
+      );
+    }
+    core.info(`Finish reason: ${finishReason || 'unknown'}`);
+
+    let content = choice?.message?.content;
+
+    // Hybrid reasoning models (GLM, DeepSeek R1, ...) put their thinking in
+    // `reasoning` and can return an empty `content` when max_tokens runs out
+    // mid-thought. The reasoning text is still a usable review, so use it.
+    if (!content || !content.trim()) {
+      const reasoning = choice?.message?.reasoning;
+      if (reasoning && reasoning.trim()) {
+        core.warning(
+          `Model returned empty content but non-empty reasoning (finish_reason=${finishReason}). Falling back to the reasoning text — consider raising max_tokens.`
+        );
+        content = reasoning;
+      }
+    }
+
+    if (!content || !content.trim()) {
+      // Log the raw envelope so a failure is diagnosable from the job log.
+      // It contains no credentials — the API key only ever travels in headers.
+      core.error(
+        `Unusable OpenRouter response. Raw body (truncated): ${JSON.stringify(
+          data
+        ).slice(0, 2000)}`
+      );
+      if (finishReason === 'length') {
+        throw new Error(
+          `Model hit the max_tokens limit (${requestBody.max_tokens}) before emitting any text. Raise max_tokens, or lower reasoning_effort.`
+        );
+      }
+      throw new Error(
+        `OpenRouter returned no usable content for model "${modelId}" (finish_reason=${finishReason}). See the raw body logged above.`
+      );
+    }
+
+    return content;
   } catch (error) {
     if (error.response?.data) {
       throw new Error(
