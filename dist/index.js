@@ -42235,8 +42235,21 @@ async function createInlineReview(octokit, context, parsed, diff, headerMsg) {
           `Finding for ${path}:${finding.line} is not on a changed line — moving it to the summary.`
         );
       }
+      // Rendered as a flat bullet: the empty bold markers this used to emit
+      // around an absent path showed up as literal '****' in the review.
+      const where = path
+        ? `\`${path}${finding.line ? `:${finding.line}` : ''}\` — `
+        : '';
+      const severity = String(finding.severity || '').toLowerCase();
+      const badge = [SEVERITY_ICON[severity] || '', severity && `**${severity}**`]
+        .filter(Boolean)
+        .join(' ');
+      const title = finding.title ? `${finding.title}` : '';
+      const detail = String(finding.body || '')
+        .replace(/\s*\n+\s*/g, ' ')
+        .trim();
       orphans.push(
-        `- **${path ? `\`${path}\`${finding.line ? `:${finding.line}` : ''} — ` : ''}**${renderFinding(finding).replace(/\n+/g, ' ')}`
+        `- ${[where + badge, title, detail].filter(Boolean).join(' — ')}`
       );
     }
   }
