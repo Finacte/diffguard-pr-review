@@ -41760,7 +41760,7 @@ async function checkCooldown(octokit, context, cooldownMinutes) {
   }
 }
 
-async function analyzeDiff(diff, modelId, openRouterKey, customPrompt, reasoningEffort, maxTokens, contextBlock, inlineComments) {
+async function analyzeDiff(diff, modelId, openRouterKey, customPrompt, reasoningEffort, maxTokens, contextBlock, inlineComments, prMetadataBlock) {
   const defaultPrompt = `You are a highly skilled staff software engineer reviewing a pull request. 
 
 Avoid generic BS advice. For each advice, please provide a file Path of the related change. No need to paste the code itself.
@@ -41826,10 +41826,12 @@ Rules for "path" and "line":
 - "line" is a line number in the NEW version of the file, and it MUST be a line
   the diff ADDS (a '+' line). Never point at a context line, a removed line, or
   a line the diff does not touch.
-- If a finding is not tied to one specific added line, omit "path" and "line".
-  It is still reported. Never drop a finding just because it has no line —
-  this includes anything about the pull request itself rather than its code,
-  such as a missing label, a missing PR-body section, or the title format.
+- If a finding is not tied to one specific added line, you MUST omit "path"
+  and "line" entirely. Never anchor such a finding to an arbitrary line, a
+  blank line, or a comment just to have somewhere to put it — an unanchored
+  finding is reported in full, so there is nothing to gain by guessing.
+  Anything about the pull request as a whole belongs in this category: its
+  title, its labels, its body, its branch name.
 - "score" is 0-100 for the overall change. Omit it if you were not asked to score.
 - "findings": [] means you found nothing at all. It must be consistent with
   "summary": an empty findings list next to a summary that describes a problem
@@ -41839,7 +41841,7 @@ Rules for "path" and "line":
   stale version number, a renamed path), the code in the diff is the truth.`
     : '\n\nProvide your analysis in the specified format.';
 
-  const fullPrompt = `${prompt}${contextBlock || ''}\n\nHere's the diff:\n${diff}${outputContract}`;
+  const fullPrompt = `${prompt}${contextBlock || ''}${prMetadataBlock || ''}\n\nHere's the diff:\n${diff}${outputContract}`;
 
   try {
     const requestBody = {
@@ -42124,6 +42126,34 @@ function extractJsonObject(text) {
     }
   }
   return null;
+}
+
+/**
+ * Describes the pull request itself — title, labels, body — so the model can
+ * judge conventions that live in PR metadata rather than in the code.
+ *
+ * Without this the model cannot see whether a required label or PR-body
+ * section is present, and reports it as missing on every run.
+ */
+function buildPrMetadataBlock(context) {
+  const pr = context.payload.pull_request;
+  if (!pr) return '';
+
+  const labels = (pr.labels || []).map((label) => label.name);
+  const body = (pr.body || '').trim();
+
+  return `\n\nPULL REQUEST METADATA
+This is the current state of the PR itself. Conventions about the PR — its
+title format, required labels, required body sections — are checked against
+this, not against the diff. Do not report something here as missing when it
+is present below.
+
+Title: ${pr.title || '(none)'}
+Labels: ${labels.length ? labels.join(', ') : '(none)'}
+Head branch: ${pr.head && pr.head.ref ? pr.head.ref : '(unknown)'}
+Body:
+${body || '(empty)'}
+`;
 }
 
 /**
@@ -42563,7 +42593,8 @@ async function run() {
       reasoningEffort,
       maxTokens,
       contextBlock,
-      inlineComments
+      inlineComments,
+      buildPrMetadataBlock(github.context)
     );
 
     // In inline mode the reply is JSON; a model that ignored the contract
