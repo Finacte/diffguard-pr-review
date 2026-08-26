@@ -325,7 +325,6 @@ Rules for "path" and "line":
 async function loadContextFiles(globsInput, maxBytes) {
   if (!globsInput || !globsInput.trim()) return '';
 
-  const glob = require('@actions/glob');
   const fs = require('fs');
   const path = require('path');
 
@@ -333,15 +332,27 @@ async function loadContextFiles(globsInput, maxBytes) {
   const patterns = globsInput
     .split(',')
     .map((p) => p.trim())
-    .filter(Boolean)
-    .map((p) => (path.isAbsolute(p) ? p : path.join(workspace, p)));
+    .filter(Boolean);
+
+  // fs.globSync keeps this dependency-free. @actions/glob would be the
+  // obvious choice, but its exports map does not resolve under the ncc
+  // version that builds dist/, and it fails the build silently.
+  if (typeof fs.globSync !== 'function') {
+    core.warning(
+      'fs.globSync is unavailable on this Node runtime; skipping context_files.'
+    );
+    return '';
+  }
 
   let files;
   try {
-    const globber = await glob.create(patterns.join('\n'), {
-      followSymbolicLinks: false,
-    });
-    files = (await globber.glob()).sort();
+    const seen = new Set();
+    for (const pattern of patterns) {
+      for (const match of fs.globSync(pattern, { cwd: workspace })) {
+        seen.add(path.resolve(workspace, match));
+      }
+    }
+    files = [...seen].sort();
   } catch (error) {
     core.warning(`Failed to expand context_files globs: ${error.message}`);
     return '';
