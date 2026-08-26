@@ -137,7 +137,7 @@ async function checkCooldown(octokit, context, cooldownMinutes) {
   }
 }
 
-async function analyzeDiff(diff, modelId, openRouterKey, customPrompt, reasoningEffort, maxTokens) {
+async function analyzeDiff(diff, modelId, openRouterKey, customPrompt, reasoningEffort, maxTokens, contextBlock, inlineComments) {
   const defaultPrompt = `You are a highly skilled staff software engineer reviewing a pull request. 
 
 Avoid generic BS advice. For each advice, please provide a file Path of the related change. No need to paste the code itself.
@@ -176,7 +176,40 @@ Here's your text with added emojis:
 Please be specific and provide actionable feedback. No generic BS advice.`;
 
   const prompt = customPrompt || defaultPrompt;
-  const fullPrompt = `${prompt}\n\nHere's the diff:\n${diff}\n\nProvide your analysis in the specified format.`;
+
+  // In inline mode the reply must be machine-readable so each finding can be
+  // anchored to a line, so the caller's output-format instructions are
+  // replaced by a JSON contract. Everything else in their prompt still applies.
+  const outputContract = inlineComments
+    ? `\n\nOUTPUT FORMAT — this overrides any formatting instructions above.
+Reply with a single JSON object and nothing else. No prose, no markdown fence.
+
+{
+  "summary": "One or two sentences on the change as a whole. Empty string if there is nothing to say.",
+  "score": 0,
+  "findings": [
+    {
+      "path": "path/to/file.kt",
+      "line": 42,
+      "severity": "low" | "medium" | "high",
+      "title": "Short label, under 80 characters",
+      "body": "What breaks and under which inputs or state. Markdown allowed."
+    }
+  ]
+}
+
+Rules for "path" and "line":
+- "path" is the file path exactly as it appears in the diff, with no a/ or b/ prefix.
+- "line" is a line number in the NEW version of the file, and it MUST be a line
+  the diff ADDS (a '+' line). Never point at a context line, a removed line, or
+  a line the diff does not touch.
+- If a finding is not tied to one specific added line, omit "path" and "line".
+  It will still be reported, in the summary.
+- "score" is 0-100 for the overall change. Omit it if you were not asked to score.
+- Return "findings": [] when the change is fine. Do not invent findings.`
+    : '\n\nProvide your analysis in the specified format.';
+
+  const fullPrompt = `${prompt}${contextBlock || ''}\n\nHere's the diff:\n${diff}${outputContract}`;
 
   try {
     const requestBody = {
@@ -195,6 +228,12 @@ Please be specific and provide actionable feedback. No generic BS advice.`;
     // `reasoning_effort` alias is not honoured by every upstream provider.
     if (reasoningEffort) {
       requestBody.reasoning = { effort: reasoningEffort };
+    }
+
+    // Ask the provider to constrain output to JSON when we need to parse it.
+    // Not every model honours this, hence the tolerant parse on the way back.
+    if (inlineComments) {
+      requestBody.response_format = { type: 'json_object' };
     }
 
     const response = await axios.post(
@@ -271,6 +310,254 @@ Please be specific and provide actionable feedback. No generic BS advice.`;
       );
     }
     throw new Error(`Failed to analyze diff: ${error.message}`);
+  }
+}
+
+/**
+ * Reads project convention files (CLAUDE.md, .claude/rules/**) from the
+ * checked-out workspace so the model reviews against the team's actual rules
+ * instead of generic best practice. Requires actions/checkout in the workflow.
+ *
+ * @param {string} globsInput - comma-separated glob patterns
+ * @param {number} maxBytes - hard cap on total context size
+ * @returns {Promise<string>} formatted context block, or '' if nothing matched
+ */
+async function loadContextFiles(globsInput, maxBytes) {
+  if (!globsInput || !globsInput.trim()) return '';
+
+  const glob = require('@actions/glob');
+  const fs = require('fs');
+  const path = require('path');
+
+  const workspace = process.env.GITHUB_WORKSPACE || process.cwd();
+  const patterns = globsInput
+    .split(',')
+    .map((p) => p.trim())
+    .filter(Boolean)
+    .map((p) => (path.isAbsolute(p) ? p : path.join(workspace, p)));
+
+  let files;
+  try {
+    const globber = await glob.create(patterns.join('\n'), {
+      followSymbolicLinks: false,
+    });
+    files = (await globber.glob()).sort();
+  } catch (error) {
+    core.warning(`Failed to expand context_files globs: ${error.message}`);
+    return '';
+  }
+
+  if (files.length === 0) {
+    core.warning(
+      `context_files matched no files. Is actions/checkout present in the job? Patterns: ${globsInput}`
+    );
+    return '';
+  }
+
+  const parts = [];
+  const included = [];
+  const skipped = [];
+  let total = 0;
+
+  for (const file of files) {
+    let stat;
+    try {
+      stat = fs.statSync(file);
+    } catch {
+      continue;
+    }
+    if (!stat.isFile()) continue;
+
+    if (total + stat.size > maxBytes) {
+      skipped.push(path.relative(workspace, file));
+      continue;
+    }
+
+    let body;
+    try {
+      body = fs.readFileSync(file, 'utf8');
+    } catch (error) {
+      core.warning(`Could not read ${file}: ${error.message}`);
+      continue;
+    }
+
+    const rel = path.relative(workspace, file);
+    parts.push(`--- ${rel} ---\n${body.trim()}`);
+    included.push(rel);
+    total += stat.size;
+  }
+
+  if (included.length === 0) return '';
+
+  core.info(
+    `Loaded ${included.length} context file(s), ${total} bytes: ${included.join(', ')}`
+  );
+  if (skipped.length > 0) {
+    core.warning(
+      `Skipped ${skipped.length} context file(s) — context_max_bytes (${maxBytes}) reached: ${skipped.join(', ')}`
+    );
+  }
+
+  return `\n\nPROJECT CONVENTIONS\nThese are this team's binding conventions. A change that violates one is a\nfinding even if it would be acceptable in a generic codebase. Cite the rule\nfile when you rely on it. Do not restate rules the diff does not touch.\n\n${parts.join('\n\n')}\n`;
+}
+
+/**
+ * Builds the set of lines that GitHub will accept an inline comment on:
+ * added ('+') lines on the right-hand side of the unified diff.
+ *
+ * GitHub rejects an entire review if any single comment targets a line
+ * outside the diff, so every finding is validated against this map first.
+ *
+ * @param {string} diff - unified diff
+ * @returns {Map<string, Set<number>>} path -> commentable new-file line numbers
+ */
+function parseCommentableLines(diff) {
+  const targets = new Map();
+  let currentPath = null;
+  let newLine = 0;
+
+  for (const raw of diff.split('\n')) {
+    if (raw.startsWith('diff --git ')) {
+      currentPath = null;
+      continue;
+    }
+    if (raw.startsWith('--- ')) continue;
+    if (raw.startsWith('+++ ')) {
+      const target = raw.slice(4).trim();
+      currentPath =
+        target === '/dev/null' ? null : target.replace(/^b\//, '');
+      if (currentPath && !targets.has(currentPath)) {
+        targets.set(currentPath, new Set());
+      }
+      continue;
+    }
+
+    const hunk = raw.match(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+    if (hunk) {
+      newLine = parseInt(hunk[1], 10);
+      continue;
+    }
+
+    if (!currentPath) continue;
+    if (raw.startsWith('\\')) continue; // "\ No newline at end of file"
+
+    if (raw.startsWith('+')) {
+      targets.get(currentPath).add(newLine);
+      newLine += 1;
+    } else if (raw.startsWith('-')) {
+      // removed line: consumes no line number in the new file
+    } else {
+      newLine += 1; // context line
+    }
+  }
+
+  return targets;
+}
+
+/** Pulls a JSON object out of a model reply that may be fenced or padded. */
+function extractJsonObject(text) {
+  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+  const candidate = (fenced ? fenced[1] : text).trim();
+  const start = candidate.indexOf('{');
+  const end = candidate.lastIndexOf('}');
+  if (start === -1 || end === -1 || end <= start) return null;
+  try {
+    return JSON.parse(candidate.slice(start, end + 1));
+  } catch {
+    return null;
+  }
+}
+
+const SEVERITY_ICON = { high: '🔥', medium: '🟡', low: '🔵' };
+
+/** Renders one finding as the body of an inline comment. */
+function renderFinding(finding) {
+  const severity = String(finding.severity || '').toLowerCase();
+  const icon = SEVERITY_ICON[severity] || '';
+  const heading = [icon, severity && `**${severity}**`, finding.title]
+    .filter(Boolean)
+    .join(' ');
+  return heading ? `${heading}\n\n${finding.body || ''}`.trim() : String(finding.body || '');
+}
+
+/**
+ * Posts the review as inline comments anchored to the changed lines, with
+ * anything unanchorable rolled into the review summary so no finding is lost.
+ *
+ * @returns {Promise<boolean>} true if an inline review was posted
+ */
+async function createInlineReview(octokit, context, parsed, diff, headerMsg) {
+  const commentable = parseCommentableLines(diff);
+  const inline = [];
+  const orphans = [];
+
+  for (const finding of parsed.findings || []) {
+    const path = finding.path && finding.path.replace(/^b\//, '');
+    const line = Number(finding.line);
+    const anchored =
+      path &&
+      Number.isInteger(line) &&
+      commentable.has(path) &&
+      commentable.get(path).has(line);
+
+    if (anchored) {
+      inline.push({ path, line, side: 'RIGHT', body: renderFinding(finding) });
+    } else {
+      if (path) {
+        core.info(
+          `Finding for ${path}:${finding.line} is not on a changed line — moving it to the summary.`
+        );
+      }
+      orphans.push(
+        `- **${path ? `\`${path}\`${finding.line ? `:${finding.line}` : ''} — ` : ''}**${renderFinding(finding).replace(/\n+/g, ' ')}`
+      );
+    }
+  }
+
+  const summaryParts = [headerMsg, '## DiffGuard AI Analysis', ''];
+  if (parsed.summary) summaryParts.push(parsed.summary, '');
+  if (inline.length > 0) {
+    summaryParts.push(
+      `${inline.length} finding(s) posted inline on the changed lines.`,
+      ''
+    );
+  }
+  if (orphans.length > 0) {
+    summaryParts.push(
+      '### Not tied to a changed line',
+      ...orphans,
+      ''
+    );
+  }
+  if (inline.length === 0 && orphans.length === 0) {
+    summaryParts.push('No findings.', '');
+  }
+  summaryParts.push(
+    '---',
+    `*Analyzed using ${core.getInput('model_id')}*`
+  );
+  const body = summaryParts.filter((p) => p !== undefined).join('\n');
+
+  try {
+    await octokit.rest.pulls.createReview({
+      owner: context.repo.owner,
+      repo: context.repo.repo,
+      pull_number: context.payload.pull_request.number,
+      event: 'COMMENT',
+      body,
+      comments: inline,
+    });
+    core.info(
+      `Inline review posted: ${inline.length} inline comment(s), ${orphans.length} in the summary.`
+    );
+    return true;
+  } catch (error) {
+    // A single bad anchor 422s the whole review. Rather than lose the
+    // analysis, fall back to one plain comment containing everything.
+    core.warning(
+      `Inline review failed (${error.message}); falling back to a single summary comment.`
+    );
+    return false;
   }
 }
 
@@ -471,6 +758,12 @@ async function run() {
     const reviewLabel = core.getInput('review_label');
     const excludeFilesInput = core.getInput('exclude_files');
     const reasoningEffort = core.getInput('reasoning_effort');
+    const contextFilesInput = core.getInput('context_files');
+    const contextMaxBytes = parseInt(
+      core.getInput('context_max_bytes') || '262144',
+      10
+    );
+    const inlineComments = core.getInput('inline_comments') === 'true';
     const maxTokens = parseInt(core.getInput('max_tokens') || '4096', 10);
     const maxPrReviews = parseInt(core.getInput('max_pr_reviews') || '10', 10);
     const cooldownPeriod = parseInt(core.getInput('cooldown_period') || '0', 10);
@@ -553,6 +846,13 @@ async function run() {
       }
     }
 
+    // Project conventions from the checked-out workspace, if any were asked for.
+    const contextBlock = await loadContextFiles(
+      contextFilesInput,
+      contextMaxBytes
+    );
+
+    core.info(`Inline comments: ${inlineComments ? 'on' : 'off'}`);
     core.info(`Sending diff to OpenRouter API for analysis...`);
     if (reasoningEffort) {
       core.info(`Using reasoning effort: ${reasoningEffort}`);
@@ -564,14 +864,34 @@ async function run() {
       openRouterKey,
       customPrompt,
       reasoningEffort,
-      maxTokens
+      maxTokens,
+      contextBlock,
+      inlineComments
     );
+
+    // In inline mode the reply is JSON; a model that ignored the contract
+    // falls back to being posted as a plain comment rather than discarded.
+    let parsed = null;
+    if (inlineComments) {
+      parsed = extractJsonObject(analysis);
+      if (!parsed || !Array.isArray(parsed.findings)) {
+        core.warning(
+          'inline_comments is on but the model did not return parseable JSON. Falling back to a single summary comment.'
+        );
+        parsed = null;
+      } else {
+        core.info(`Parsed ${parsed.findings.length} finding(s) from the model.`);
+      }
+    }
 
     // Get minimum_score input (default 75)
     const minimumScore = parseInt(core.getInput('minimum_score') || '75', 10);
 
     // Extract score and block PR if below minimum
-    const score = extractScore(analysis);
+    const score =
+      parsed && Number.isFinite(Number(parsed.score))
+        ? Number(parsed.score)
+        : extractScore(analysis);
     let warningMsg = '';
     if (score !== null) {
       core.info(
@@ -587,8 +907,21 @@ async function run() {
       core.warning('Could not extract score from AI analysis.');
     }
 
-    // Post the analysis as a PR comment, with warning if needed
-    await createPRComment(octokit, github.context, warningMsg + analysis);
+    // Post inline where we can anchor findings to changed lines; otherwise
+    // (or if GitHub rejects the review) post the analysis as one comment.
+    let posted = false;
+    if (parsed) {
+      posted = await createInlineReview(
+        octokit,
+        github.context,
+        parsed,
+        diff,
+        warningMsg
+      );
+    }
+    if (!posted) {
+      await createPRComment(octokit, github.context, warningMsg + analysis);
+    }
     core.info(`PR comment posted successfully`);
   } catch (error) {
     core.error(`Error details: ${JSON.stringify(error)}`);

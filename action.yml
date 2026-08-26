@@ -259,6 +259,17 @@ inputs:
   reasoning_effort:
     description: 'Reasoning effort for reasoning models. Accepted values are model-specific (GLM: low/high/max, OpenAI: low/medium/high). Reasoning tokens are billed as output and count against max_tokens, so a low effort plus a roomy max_tokens is usually right. OpenRouter docs: https://openrouter.ai/docs/use-cases/reasoning-tokens#reasoning-effort-level'
     required: false
+  context_files:
+    description: 'Comma-separated globs of project convention files to give the model as context, resolved against the checked-out workspace (e.g. "CLAUDE.md,.claude/rules/**/*.md"). Requires actions/checkout in the job. Empty means no project context.'
+    required: false
+  context_max_bytes:
+    description: 'Hard cap on the total size of context_files, in bytes. Files past the cap are skipped and named in the log. Default 262144 (256 KiB).'
+    required: false
+    default: '262144'
+  inline_comments:
+    description: 'Set to "true" to post findings as inline review comments anchored to the changed lines, instead of one summary comment. Findings that cannot be anchored are rolled into the review summary. Falls back to a single comment if the model returns unparseable output or GitHub rejects the review.'
+    required: false
+    default: 'false'
   minimum_score:
     description: 'Minimum AI review score (0-100) required to pass the check and allow merging. PRs with a lower score will be blocked. Default: 75.'
     required: false
