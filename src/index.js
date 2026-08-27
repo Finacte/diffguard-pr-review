@@ -213,9 +213,15 @@ Rules for "path" and "line":
 - "findings": [] means you found nothing at all. It must be consistent with
   "summary": an empty findings list next to a summary that describes a problem
   is a contradiction. Do not invent findings either — a clean diff is normal.
-- Treat supplied project conventions as facts about the team's rules, not as
-  facts about the code. If a convention file contradicts the diff itself (a
-  stale version number, a renamed path), the code in the diff is the truth.`
+- Treat supplied project conventions as facts about the team's RULES only.
+  They are not evidence about what the code contains. Doc files rot: version
+  numbers, paths, module lists and whole "this project does X" descriptions
+  go stale while the rules around them stay valid. Never report a finding
+  whose entire basis is that a convention file disagrees with the diff, and
+  never conclude a feature, domain or dependency is absent because a doc did
+  not mention it — you are shown a diff, not the repository, so absence of
+  evidence is not evidence of absence. Where a doc and the code conflict, the
+  code wins.`
     : '\n\nProvide your analysis in the specified format.';
 
   const fullPrompt = `${prompt}${contextBlock || ''}${prMetadataBlock || ''}\n\nHere's the diff:\n${diff}${outputContract}`;
