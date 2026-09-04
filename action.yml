@@ -282,6 +282,22 @@ inputs:
     description: 'Cooldown period between reviews in minutes. If another review was posted within this time, the review will be skipped. Default: 0 (no cooldown).'
     required: false
     default: '0'
+  severity_threshold:
+    description: 'Lowest severity worth posting: "low", "medium" or "high". Findings below it are dropped instead of being demoted into the summary. Default "low" (post everything).'
+    required: false
+    default: 'low'
+  incremental_reviews:
+    description: 'Set to "true" so a re-review only reports findings anchored to lines pushed since this action last reviewed the PR. The whole PR diff is still sent as context, but earlier commits are not re-litigated and PR-wide findings (title, labels, body) are left to the first review. Requires inline_comments.'
+    required: false
+    default: 'false'
+  suppress_duplicates:
+    description: 'Set to "false" to allow a finding this action already posted on the PR to be posted again. Matching is by anchor (path:line) and by normalised title. Requires inline_comments.'
+    required: false
+    default: 'true'
+  resolve_outdated_threads:
+    description: 'Set to "true" to resolve this action own review threads that GitHub has marked outdated, i.e. the line the finding pointed at has since been rewritten. Never touches a human thread, and never resolves a thread whose line still stands.'
+    required: false
+    default: 'false'
 
 runs:
   using: 'node24'

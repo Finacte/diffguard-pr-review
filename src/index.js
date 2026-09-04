@@ -37,107 +37,154 @@ async function shouldReviewPR(octokit, context, requiredLabel) {
   }
 }
 
+const REVIEW_MARKER = '## DiffGuard AI Analysis';
+
 /**
- * Checks if the PR review should be skipped based on existing review count
- * @param {object} octokit - Octokit client
- * @param {object} context - GitHub context
- * @param {number} maxReviews - Maximum allowed reviews
- * @returns {Promise<{shouldSkip: boolean, currentCount: number, message: string}>}
+ * Collects every review this action has already posted on the PR.
+ *
+ * Both output paths carry REVIEW_MARKER, but they land in different places:
+ * inline mode creates a pull request *review*, the fallback path creates an
+ * *issue comment*. Querying only comments (as this used to) leaves the review
+ * count and the cooldown permanently blind in inline mode, so both are read.
+ *
+ * Matching on the marker instead of on "any bot" also stops Dependabot,
+ * CodeRabbit or a release bot from being counted as one of our reviews.
+ *
+ * @returns {Promise<{count: number, latestAt: Date|null, latestSha: string|null}>}
  */
-async function checkReviewCount(octokit, context, maxReviews) {
+async function getPriorReviews(octokit, context) {
+  const owner = context.repo.owner;
+  const repo = context.repo.repo;
+  const pull_number = context.payload.pull_request.number;
+  const entries = [];
+
   try {
-    const { data: comments } = await octokit.rest.issues.listComments({
-      owner: context.repo.owner,
-      repo: context.repo.repo,
-      issue_number: context.payload.pull_request.number,
+    const comments = await octokit.paginate(octokit.rest.issues.listComments, {
+      owner,
+      repo,
+      issue_number: pull_number,
+      per_page: 100,
     });
-
-    // Count DiffGuard comments (by bot or containing our marker)
-    const diffGuardComments = comments.filter(comment => {
-      // Check if comment is from a bot or contains our analysis header
-      const isBotComment = comment.user?.type === 'Bot' || comment.user?.login === 'diffguard[bot]';
-      const hasAnalysisMarker = comment.body?.includes('## DiffGuard AI Analysis');
-      return isBotComment || hasAnalysisMarker;
-    });
-
-    const currentCount = diffGuardComments.length;
-
-    core.info(`Current DiffGuard review count: ${currentCount} (max: ${maxReviews})`);
-
-    if (currentCount >= maxReviews) {
-      return {
-        shouldSkip: true,
-        currentCount,
-        message: `Maximum review limit reached (${maxReviews}). Skipping review to save credits.`
-      };
+    for (const comment of comments) {
+      if (comment.body?.includes(REVIEW_MARKER)) {
+        entries.push({ at: new Date(comment.created_at), sha: null });
+      }
     }
-
-    return { shouldSkip: false, currentCount, message: '' };
   } catch (error) {
-    core.warning(`Failed to check review count: ${error.message}. Proceeding with review.`);
-    return { shouldSkip: false, currentCount: 0, message: '' };
-  }
-}
-
-/**
- * Checks if the PR review should be skipped based on cooldown period
- * @param {object} octokit - Octokit client
- * @param {object} context - GitHub context
- * @param {number} cooldownMinutes - Cooldown period in minutes
- * @returns {Promise<{shouldSkip: boolean, lastReviewTime: Date | null, message: string}>}
- */
-async function checkCooldown(octokit, context, cooldownMinutes) {
-  if (cooldownMinutes <= 0) {
-    return { shouldSkip: false, lastReviewTime: null, message: '' };
+    core.warning(`Failed to list PR comments: ${error.message}`);
   }
 
   try {
-    const { data: comments } = await octokit.rest.issues.listComments({
+    const reviews = await octokit.paginate(octokit.rest.pulls.listReviews, {
+      owner,
+      repo,
+      pull_number,
+      per_page: 100,
+    });
+    for (const review of reviews) {
+      if (review.body?.includes(REVIEW_MARKER)) {
+        entries.push({
+          at: new Date(review.submitted_at),
+          sha: review.commit_id || null,
+        });
+      }
+    }
+  } catch (error) {
+    core.warning(`Failed to list PR reviews: ${error.message}`);
+  }
+
+  entries.sort((a, b) => a.at - b.at);
+  const withSha = entries.filter((entry) => entry.sha);
+
+  return {
+    count: entries.length,
+    latestAt: entries.length ? entries[entries.length - 1].at : null,
+    latestSha: withSha.length ? withSha[withSha.length - 1].sha : null,
+  };
+}
+
+/**
+ * @returns {{shouldSkip: boolean, message: string}}
+ */
+function checkReviewCount(prior, maxReviews) {
+  core.info(`Current DiffGuard review count: ${prior.count} (max: ${maxReviews})`);
+
+  if (prior.count >= maxReviews) {
+    return {
+      shouldSkip: true,
+      message: `Maximum review limit reached (${maxReviews}). Skipping review to save credits.`,
+    };
+  }
+
+  return { shouldSkip: false, message: '' };
+}
+
+/**
+ * @returns {{shouldSkip: boolean, message: string}}
+ */
+function checkCooldown(prior, cooldownMinutes) {
+  if (cooldownMinutes <= 0 || !prior.latestAt) {
+    return { shouldSkip: false, message: '' };
+  }
+
+  const timeSinceLastReview = Date.now() - prior.latestAt.getTime();
+  const cooldownMs = cooldownMinutes * 60 * 1000;
+
+  core.info(
+    `Last review was at ${prior.latestAt.toISOString()} (${Math.round(
+      timeSinceLastReview / 1000
+    )}s ago); cooldown is ${cooldownMinutes}m`
+  );
+
+  if (timeSinceLastReview < cooldownMs) {
+    const remainingMinutes = Math.ceil(
+      (cooldownMs - timeSinceLastReview) / (60 * 1000)
+    );
+    return {
+      shouldSkip: true,
+      message: `Cooldown active. Last review was ${Math.round(
+        timeSinceLastReview / 1000
+      )}s ago. Please wait ${remainingMinutes} more minutes.`,
+    };
+  }
+
+  return { shouldSkip: false, message: '' };
+}
+
+/**
+ * Diff of everything pushed since the last review this action posted.
+ *
+ * Anchored on that review's own head commit rather than on the push event's
+ * `before` SHA: when a push's review is skipped (cooldown, queue, transient
+ * model failure) the commits it carried would otherwise never be looked at by
+ * any run.
+ *
+ * @returns {Promise<string|null>} the diff, or null when it cannot be computed
+ */
+async function getDiffSince(octokit, context, baseSha) {
+  const headSha = context.payload.pull_request.head?.sha;
+  if (!baseSha || !headSha || baseSha === headSha) {
+    return null;
+  }
+
+  try {
+    const { data } = await octokit.rest.repos.compareCommitsWithBasehead({
       owner: context.repo.owner,
       repo: context.repo.repo,
-      issue_number: context.payload.pull_request.number,
-      per_page: 10, // Only need recent comments
-      sort: 'created',
-      direction: 'desc'
+      basehead: `${baseSha}...${headSha}`,
+      mediaType: { format: 'diff' },
     });
-
-    // Find most recent DiffGuard comment
-    const latestComment = comments.find(comment => {
-      const isBotComment = comment.user?.type === 'Bot' || comment.user?.login === 'diffguard[bot]';
-      const hasAnalysisMarker = comment.body?.includes('## DiffGuard AI Analysis');
-      return isBotComment || hasAnalysisMarker;
-    });
-
-    if (!latestComment) {
-      core.info('No previous DiffGuard reviews found. Cooldown not applicable.');
-      return { shouldSkip: false, lastReviewTime: null, message: '' };
-    }
-
-    const lastReviewTime = new Date(latestComment.created_at);
-    const now = new Date();
-    const timeSinceLastReview = now - lastReviewTime;
-    const cooldownMs = cooldownMinutes * 60 * 1000;
-
-    core.info(`Last review was at ${lastReviewTime.toISOString()} (${Math.round(timeSinceLastReview / 1000)}s ago)`);
-    core.info(`Cooldown period: ${cooldownMinutes}m (${cooldownMs}ms)`);
-
-    if (timeSinceLastReview < cooldownMs) {
-      const remainingMinutes = Math.ceil((cooldownMs - timeSinceLastReview) / (60 * 1000));
-      return {
-        shouldSkip: true,
-        lastReviewTime,
-        message: `Cooldown active. Last review was ${Math.round(timeSinceLastReview / 1000)}s ago. Please wait ${remainingMinutes} more minutes.`
-      };
-    }
-
-    return { shouldSkip: false, lastReviewTime, message: '' };
+    return typeof data === 'string' && data.trim() ? data : null;
   } catch (error) {
-    core.warning(`Failed to check cooldown: ${error.message}. Proceeding with review.`);
-    return { shouldSkip: false, lastReviewTime: null, message: '' };
+    // A rebase or force-push can leave the previously reviewed SHA unreachable.
+    core.warning(
+      `Could not diff ${baseSha}...${headSha} (${error.message}). Reviewing the whole PR instead.`
+    );
+    return null;
   }
 }
 
-async function analyzeDiff(diff, modelId, openRouterKey, customPrompt, reasoningEffort, maxTokens, contextBlock, inlineComments, prMetadataBlock) {
+async function analyzeDiff(diff, modelId, openRouterKey, customPrompt, reasoningEffort, maxTokens, contextBlock, inlineComments, prMetadataBlock, reviewScopeBlock) {
   const defaultPrompt = `You are a highly skilled staff software engineer reviewing a pull request. 
 
 Avoid generic BS advice. For each advice, please provide a file Path of the related change. No need to paste the code itself.
@@ -224,7 +271,7 @@ Rules for "path" and "line":
   code wins.`
     : '\n\nProvide your analysis in the specified format.';
 
-  const fullPrompt = `${prompt}${contextBlock || ''}${prMetadataBlock || ''}\n\nHere's the diff:\n${diff}${outputContract}`;
+  const fullPrompt = `${prompt}${contextBlock || ''}${prMetadataBlock || ''}\n\nHere's the diff:\n${diff}${reviewScopeBlock || ''}${outputContract}`;
 
   try {
     const requestBody = {
@@ -579,6 +626,261 @@ function coerceReviewObject(value, depth = 0) {
 }
 
 const SEVERITY_ICON = { high: '🔥', medium: '🟡', low: '🔵' };
+const SEVERITY_RANK = { low: 1, medium: 2, high: 3 };
+
+/** First line of every inline finding this action posts: icon, severity, title. */
+const FINDING_HEADING = /^\s*(?:🔥|🟡|🔵)?\s*\*\*(high|medium|low)\*\*\s*(.*)$/;
+
+function normaliseTitle(text) {
+  return String(text || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+}
+
+/**
+ * Reads back the inline findings this action already posted on the PR, so the
+ * next push does not raise them a second time.
+ *
+ * Two keys are kept because neither alone holds up. GitHub re-anchors a
+ * comment's `line` as the diff evolves and nulls it once the thread goes
+ * outdated, so path:line drifts away from the finding; and the model rewords a
+ * title between runs, so titles alone miss. A hit on either counts as already
+ * reported — over-suppressing one repeat costs a comment, while under-
+ * suppressing is the failure the author actually complains about.
+ *
+ * @returns {Promise<{anchors: Set<string>, titles: Set<string>, count: number}>}
+ */
+async function loadReportedFindings(octokit, context) {
+  const reported = { anchors: new Set(), titles: new Set(), count: 0 };
+
+  let comments;
+  try {
+    comments = await octokit.paginate(octokit.rest.pulls.listReviewComments, {
+      owner: context.repo.owner,
+      repo: context.repo.repo,
+      pull_number: context.payload.pull_request.number,
+      per_page: 100,
+    });
+  } catch (error) {
+    core.warning(
+      `Failed to list existing review comments: ${error.message}. Duplicate suppression is off for this run.`
+    );
+    return reported;
+  }
+
+  for (const comment of comments) {
+    if (comment.user?.type !== 'Bot') continue;
+
+    const heading = String(comment.body || '')
+      .split('\n')[0]
+      .match(FINDING_HEADING);
+    if (!heading) continue;
+
+    reported.count += 1;
+
+    const title = normaliseTitle(heading[2]);
+    if (title) reported.titles.add(title);
+
+    const line = comment.line ?? comment.original_line;
+    if (comment.path && Number.isInteger(line)) {
+      reported.anchors.add(`${comment.path}:${line}`);
+    }
+  }
+
+  core.info(`${reported.count} finding(s) already reported on this PR.`);
+  return reported;
+}
+
+/**
+ * Drops the findings the team asked not to see: below the severity floor,
+ * already reported on an earlier push, or outside the lines the latest push
+ * added.
+ *
+ * All three rules are enforced here rather than left to the prompt. The
+ * instructions still go to the model so it does not waste its budget, but a
+ * review pipeline must not depend on a model reliably obeying "do not repeat
+ * yourself".
+ *
+ * @returns {{kept: object[], dropped: {severity: number, duplicate: number, outOfScope: number}}}
+ */
+function selectFindings(findings, { severityFloor, reported, scope }) {
+  const kept = [];
+  const dropped = { severity: 0, duplicate: 0, outOfScope: 0 };
+
+  for (const finding of findings || []) {
+    const severity = String(finding.severity || '').toLowerCase();
+    const rank = SEVERITY_RANK[severity] || 0;
+
+    // rank 0 is an unrecognised severity: keep it rather than silently
+    // swallowing a finding because the model mislabelled it.
+    if (rank > 0 && rank < severityFloor) {
+      dropped.severity += 1;
+      continue;
+    }
+
+    const path = finding.path && String(finding.path).replace(/^b\//, '');
+    const line = Number(finding.line);
+    const anchored = Boolean(path) && Number.isInteger(line);
+
+    if (scope) {
+      // An unanchored finding is about the pull request as a whole - its
+      // title, labels, body, branch name. That was reported when the PR was
+      // opened and nothing in a later push changes it, so it would come back
+      // on every single push.
+      if (!anchored || !scope.get(path)?.has(line)) {
+        dropped.outOfScope += 1;
+        continue;
+      }
+    }
+
+    if (reported) {
+      const title = normaliseTitle(finding.title);
+      const isDuplicate =
+        (anchored && reported.anchors.has(`${path}:${line}`)) ||
+        (Boolean(title) && reported.titles.has(title));
+      if (isDuplicate) {
+        dropped.duplicate += 1;
+        continue;
+      }
+    }
+
+    kept.push(finding);
+  }
+
+  return { kept, dropped };
+}
+
+/**
+ * Tells the model what this run is allowed to report. The filter in
+ * selectFindings is the authority; this only stops the model spending its
+ * output budget on findings that would be thrown away.
+ */
+function buildReviewScopeBlock({ severityFloor, reported, incrementalDiff }) {
+  const parts = [];
+
+  if (severityFloor > 1) {
+    const floorName = Object.keys(SEVERITY_RANK).find(
+      (name) => SEVERITY_RANK[name] === severityFloor
+    );
+    parts.push(`SEVERITY FLOOR
+Report only findings of severity ${floorName} or above. A lower-severity
+nitpick is not worth a reviewer's attention here: leave it out entirely rather
+than mentioning it in the summary or downgrading it into another finding.`);
+  }
+
+  if (reported && reported.titles.size > 0) {
+    parts.push(`ALREADY REPORTED - DO NOT REPEAT
+These findings were posted on an earlier push of this same pull request. The
+author has seen each one and either fixed it or answered it. Raising any of
+them again, in any wording, is this review's worst failure mode. If you
+believe one was answered wrongly, stay silent - a human reviewer owns that
+argument, not you.
+
+${[...reported.titles].map((title) => `- ${title}`).join('\n')}`);
+  }
+
+  if (incrementalDiff) {
+    parts.push(`IN SCOPE FOR THIS RUN
+The whole pull request is shown above for context, but only the changes below
+were pushed since the last review. Anchor every finding to a line that this
+newer diff adds; anything else is discarded before posting. Say nothing about
+the pull request as a whole - its title, labels, body or branch name - that
+was covered when the PR was opened.
+
+${incrementalDiff}`);
+  }
+
+  return parts.length ? `\n\n${parts.join('\n\n')}\n` : '';
+}
+
+/**
+ * Resolves this action's own review threads that GitHub has marked outdated:
+ * the line the finding pointed at has since been rewritten, so the comment no
+ * longer describes the code and only clutters the conversation.
+ *
+ * Only outdated threads are touched. "The author changed this line" is a fact
+ * GitHub computes; "the author fixed the bug" is not, and resolving on that
+ * guess would bury real findings. The comment stays readable under the fold
+ * and a human can reopen the thread.
+ *
+ * @returns {Promise<number>} how many threads were resolved
+ */
+async function resolveOutdatedThreads(octokit, context) {
+  const query = `
+    query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
+      repository(owner: $owner, name: $repo) {
+        pullRequest(number: $number) {
+          reviewThreads(first: 100, after: $cursor) {
+            pageInfo { hasNextPage endCursor }
+            nodes {
+              id
+              isResolved
+              isOutdated
+              comments(first: 1) {
+                nodes { body author { login __typename } }
+              }
+            }
+          }
+        }
+      }
+    }`;
+
+  const stale = [];
+  let cursor = null;
+
+  try {
+    for (;;) {
+      const result = await octokit.graphql(query, {
+        owner: context.repo.owner,
+        repo: context.repo.repo,
+        number: context.payload.pull_request.number,
+        cursor,
+      });
+      const threads = result.repository.pullRequest.reviewThreads;
+
+      for (const thread of threads.nodes) {
+        if (thread.isResolved || !thread.isOutdated) continue;
+
+        const first = thread.comments.nodes[0];
+        if (!first || first.author?.__typename !== 'Bot') continue;
+        if (!FINDING_HEADING.test(String(first.body || '').split('\n')[0])) {
+          continue;
+        }
+
+        stale.push(thread.id);
+      }
+
+      if (!threads.pageInfo.hasNextPage) break;
+      cursor = threads.pageInfo.endCursor;
+    }
+  } catch (error) {
+    core.warning(`Could not list review threads: ${error.message}`);
+    return 0;
+  }
+
+  const mutation = `
+    mutation($threadId: ID!) {
+      resolveReviewThread(input: { threadId: $threadId }) { thread { id } }
+    }`;
+
+  let resolved = 0;
+  for (const threadId of stale) {
+    try {
+      await octokit.graphql(mutation, { threadId });
+      resolved += 1;
+    } catch (error) {
+      core.warning(`Could not resolve thread ${threadId}: ${error.message}`);
+    }
+  }
+
+  if (resolved > 0) {
+    core.info(
+      `Resolved ${resolved} outdated finding thread(s) whose anchored lines have changed.`
+    );
+  }
+  return resolved;
+}
 
 /** Renders one finding as the body of an inline comment. */
 function renderFinding(finding) {
@@ -596,7 +898,7 @@ function renderFinding(finding) {
  *
  * @returns {Promise<boolean>} true if an inline review was posted
  */
-async function createInlineReview(octokit, context, parsed, diff, headerMsg) {
+async function createInlineReview(octokit, context, parsed, diff, headerMsg, notes) {
   const commentable = parseCommentableLines(diff);
   const inline = [];
   const orphans = [];
@@ -654,6 +956,11 @@ async function createInlineReview(octokit, context, parsed, diff, headerMsg) {
   }
   if (inline.length === 0 && orphans.length === 0) {
     summaryParts.push('No findings.', '');
+  }
+  // Say what this run covered and what it deliberately left out, so nobody has
+  // to guess whether the review is still thinking or simply had nothing to add.
+  if (notes && notes.length > 0) {
+    summaryParts.push('<sub>', ...notes.map((note) => `${note}<br>`), '</sub>', '');
   }
   summaryParts.push(
     '---',
@@ -890,6 +1197,15 @@ async function run() {
     const maxTokens = parseInt(core.getInput('max_tokens') || '4096', 10);
     const maxPrReviews = parseInt(core.getInput('max_pr_reviews') || '10', 10);
     const cooldownPeriod = parseInt(core.getInput('cooldown_period') || '0', 10);
+    const severityFloor =
+      SEVERITY_RANK[(core.getInput('severity_threshold') || 'low').toLowerCase()] ||
+      SEVERITY_RANK.low;
+    // Both only make sense against per-finding output, which is inline mode.
+    const incrementalReviews =
+      inlineComments && core.getInput('incremental_reviews') === 'true';
+    const suppressDuplicates =
+      inlineComments && core.getInput('suppress_duplicates') !== 'false';
+    const resolveThreads = core.getInput('resolve_outdated_threads') === 'true';
 
     // Process exclude patterns
     const excludePatterns = excludeFilesInput
@@ -906,6 +1222,10 @@ async function run() {
     );
     core.info(`Max PR Reviews: ${maxPrReviews}`);
     core.info(`Cooldown Period: ${cooldownPeriod} minutes`);
+    core.info(`Severity threshold: ${core.getInput('severity_threshold') || 'low'}`);
+    core.info(`Incremental reviews: ${incrementalReviews ? 'on' : 'off'}`);
+    core.info(`Suppress duplicates: ${suppressDuplicates ? 'on' : 'off'}`);
+    core.info(`Resolve outdated threads: ${resolveThreads ? 'on' : 'off'}`);
 
     // Get GitHub token and create octokit client
     const token = core.getInput('github_token', { required: true });
@@ -922,18 +1242,26 @@ async function run() {
       return;
     }
 
-    // Check review count limit
-    const reviewCountCheck = await checkReviewCount(octokit, github.context, maxPrReviews);
+    // One read of what we already said on this PR, feeding the review limit,
+    // the cooldown and the incremental scope alike.
+    const prior = await getPriorReviews(octokit, github.context);
+
+    const reviewCountCheck = checkReviewCount(prior, maxPrReviews);
     if (reviewCountCheck.shouldSkip) {
       core.info(`Skipping review: ${reviewCountCheck.message}`);
       return;
     }
 
-    // Check cooldown period
-    const cooldownCheck = await checkCooldown(octokit, github.context, cooldownPeriod);
+    const cooldownCheck = checkCooldown(prior, cooldownPeriod);
     if (cooldownCheck.shouldSkip) {
       core.info(`Skipping review: ${cooldownCheck.message}`);
       return;
+    }
+
+    // Done before the review is posted, so a finding whose line has since been
+    // rewritten is folded away rather than sitting next to the new one.
+    if (resolveThreads) {
+      await resolveOutdatedThreads(octokit, github.context);
     }
 
     core.info(`Fetching PR diff...`);
@@ -975,6 +1303,21 @@ async function run() {
       contextMaxBytes
     );
 
+    // What the latest push added, if this is a re-review and we can work it out.
+    const incrementalDiff = incrementalReviews
+      ? await getDiffSince(octokit, github.context, prior.latestSha)
+      : null;
+    const scope = incrementalDiff ? parseCommentableLines(incrementalDiff) : null;
+    if (scope) {
+      core.info(
+        `Incremental scope: ${scope.size} file(s) changed since ${prior.latestSha.slice(0, 7)}.`
+      );
+    }
+
+    const reported = suppressDuplicates
+      ? await loadReportedFindings(octokit, github.context)
+      : null;
+
     core.info(`Inline comments: ${inlineComments ? 'on' : 'off'}`);
     core.info(`Sending diff to OpenRouter API for analysis...`);
     if (reasoningEffort) {
@@ -990,7 +1333,8 @@ async function run() {
       maxTokens,
       contextBlock,
       inlineComments,
-      buildPrMetadataBlock(github.context)
+      buildPrMetadataBlock(github.context),
+      buildReviewScopeBlock({ severityFloor, reported, incrementalDiff })
     );
 
     // In inline mode the reply is JSON; a model that ignored the contract
@@ -1006,6 +1350,48 @@ async function run() {
       } else {
         core.info(`Parsed ${parsed.findings.length} finding(s) from the model.`);
       }
+    }
+
+    // Enforce the severity floor, the no-repeats rule and the incremental
+    // scope on the parsed findings before anything is posted.
+    const notes = [];
+    if (parsed) {
+      const { kept, dropped } = selectFindings(parsed.findings, {
+        severityFloor,
+        reported,
+        scope,
+      });
+      core.info(
+        `Findings: ${kept.length} to post, ${dropped.severity} below the severity floor, ` +
+          `${dropped.duplicate} already reported, ${dropped.outOfScope} outside this run's scope.`
+      );
+      parsed = { ...parsed, findings: kept };
+
+      notes.push(
+        scope
+          ? `Scope: the ${scope.size} file(s) changed since \`${prior.latestSha.slice(
+              0,
+              7
+            )}\`. Earlier commits were reviewed before and are not revisited.`
+          : 'Scope: the full pull request diff.'
+      );
+      if (severityFloor > 1) {
+        const floorName = Object.keys(SEVERITY_RANK).find(
+          (name) => SEVERITY_RANK[name] === severityFloor
+        );
+        notes.push(`Severity floor: \`${floorName}\` and above.`);
+      }
+      const suppressed =
+        dropped.severity + dropped.duplicate + dropped.outOfScope;
+      if (suppressed > 0) {
+        notes.push(
+          `Suppressed ${suppressed} finding(s): ${dropped.duplicate} already reported, ` +
+            `${dropped.severity} below the severity floor, ${dropped.outOfScope} outside this scope.`
+        );
+      }
+      notes.push(
+        'This is the complete review for these commits — nothing further will be posted for them.'
+      );
     }
 
     // Get minimum_score input (default 75)
@@ -1040,7 +1426,8 @@ async function run() {
         github.context,
         parsed,
         diff,
-        warningMsg
+        warningMsg,
+        notes
       );
     }
     if (!posted) {
